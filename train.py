@@ -7,6 +7,8 @@ import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 import time
 import random
+import os
+from tqdm import tqdm
 
 from models.mnist_model import Generator, Discriminator, DHead, QHead
 from dataloader import get_data
@@ -21,6 +23,15 @@ elif(params['dataset'] == 'CelebA'):
     from models.celeba_model import Generator, Discriminator, DHead, QHead
 elif(params['dataset'] == 'FashionMNIST'):
     from models.mnist_model import Generator, Discriminator, DHead, QHead
+elif(params['dataset'] == 'MovingMNIST'):
+    from models.moving_mnist_model import Generator, Discriminator, DHead, QHead
+
+dirname = "./results/movingmnist10/"
+if not os.path.exists(dirname):
+    os.makedirs(dirname)
+if not os.path.exists(os.path.join(dirname, 'checkpoint')):
+    os.makedirs(os.path.join(dirname, 'checkpoint'))
+os.chdir(dirname)
 
 # Set random seed for reproducibility.
 seed = 1123
@@ -60,30 +71,37 @@ elif(params['dataset'] == 'FashionMNIST'):
     params['num_dis_c'] = 1
     params['dis_c_dim'] = 10
     params['num_con_c'] = 2
+elif(params['dataset'] == 'MovingMNIST'):
+    params['num_z'] = 128
+    params['num_dis_c'] = 2
+    params['dis_c_dim'] = 10
+    params['num_con_c'] = 8
 
 # Plot the training images.
 sample_batch = next(iter(dataloader))
 plt.figure(figsize=(10, 10))
 plt.axis("off")
+if type(sample_batch) == list:
+    sample_batch = sample_batch[0]
 plt.imshow(np.transpose(vutils.make_grid(
-    sample_batch[0].to(device)[ : 100], nrow=10, padding=2, normalize=True).cpu(), (1, 2, 0)))
+    sample_batch.to(device)[ : 100], nrow=10, padding=2, normalize=True).cpu(), (1, 2, 0)))
 plt.savefig('Training Images {}'.format(params['dataset']))
 plt.close('all')
 
 # Initialise the network.
-netG = Generator().to(device)
+netG = Generator(params).to(device)
 netG.apply(weights_init)
 print(netG)
 
-discriminator = Discriminator().to(device)
+discriminator = Discriminator(params).to(device)
 discriminator.apply(weights_init)
 print(discriminator)
 
-netD = DHead().to(device)
+netD = DHead(params).to(device)
 netD.apply(weights_init)
 print(netD)
 
-netQ = QHead().to(device)
+netQ = QHead(params).to(device)
 netQ.apply(weights_init)
 print(netQ)
 
@@ -97,6 +115,8 @@ criterionQ_con = NormalNLLLoss()
 # Adam optimiser is used.
 optimD = optim.Adam([{'params': discriminator.parameters()}, {'params': netD.parameters()}], lr=params['learning_rate'], betas=(params['beta1'], params['beta2']))
 optimG = optim.Adam([{'params': netG.parameters()}, {'params': netQ.parameters()}], lr=params['learning_rate'], betas=(params['beta1'], params['beta2']))
+# schedulerD = torch.optim.lr_scheduler.ExponentialLR(optimD, gamma=0.99)
+# schedulerG = torch.optim.lr_scheduler.ExponentialLR(optimG, gamma=0.99)
 
 # Fixed Noise
 z = torch.randn(100, params['num_z'], 1, 1, device=device)
@@ -131,10 +151,14 @@ print("-"*25)
 start_time = time.time()
 iters = 0
 
+video_num_frame = 20
+
 for epoch in range(params['num_epochs']):
     epoch_start_time = time.time()
 
-    for i, (data, _) in enumerate(dataloader, 0):
+    for i, data in tqdm(enumerate(dataloader, 0), total=len(dataloader)):
+        if type(data) == list:
+            data = data[0]
         # Get batch size
         b_size = data.size(0)
         # Transfer data tensor to GPU/CPU (device)
@@ -146,7 +170,18 @@ for epoch in range(params['num_epochs']):
         label = torch.full((b_size, ), real_label, device=device)
         output1 = discriminator(real_data)
         probs_real = netD(output1).view(-1)
-        loss_real = criterionD(probs_real, label)
+        
+        loss_real = criterionD(probs_real, label.float())
+        
+        if params['dataset'] == 'MovingMNIST':
+            q_logits_real, q_mu_real, q_var_real = netQ(output1)
+            # add a loss that make the q_logits_real to be the same every 20 frames
+            for j in range(0, len(q_logits_real), video_num_frame):
+                q_logits_real[j:j+video_num_frame] = nn.functional.softmax(q_logits_real[j:j+video_num_frame], dim=1)
+                mean_dist = torch.mean(q_logits_real[j:j+video_num_frame], dim=0)
+                # minimize the entropy of the mean_dist
+                entropy = -torch.sum(mean_dist * torch.log(mean_dist + 1e-8))
+                loss_real += entropy * 0.01
         # Calculate gradients.
         loss_real.backward()
 
@@ -156,7 +191,7 @@ for epoch in range(params['num_epochs']):
         fake_data = netG(noise)
         output2 = discriminator(fake_data.detach())
         probs_fake = netD(output2).view(-1)
-        loss_fake = criterionD(probs_fake, label)
+        loss_fake = criterionD(probs_fake, label.float())
         # Calculate gradients.
         loss_fake.backward()
 
@@ -172,7 +207,7 @@ for epoch in range(params['num_epochs']):
         output = discriminator(fake_data)
         label.fill_(real_label)
         probs_fake = netD(output).view(-1)
-        gen_loss = criterionD(probs_fake, label)
+        gen_loss = criterionD(probs_fake, label.float())
 
         q_logits, q_mu, q_var = netQ(output)
         target = torch.LongTensor(idx).to(device)
@@ -184,10 +219,9 @@ for epoch in range(params['num_epochs']):
         # Calculating loss for continuous latent code.
         con_loss = 0
         if (params['num_con_c'] != 0):
-            con_loss = criterionQ_con(noise[:, params['num_z']+ params['num_dis_c']*params['dis_c_dim'] : ].view(-1, params['num_con_c']), q_mu, q_var)*0.1
-
+            con_loss = criterionQ_con(noise[:, params['num_z']+ params['num_dis_c']*params['dis_c_dim'] : ].view(-1, params['num_con_c']), q_mu, q_var)*0.5
         # Net loss for generator.
-        G_loss = gen_loss + dis_loss + con_loss
+        G_loss = gen_loss + dis_loss*1.5 + con_loss
         # Calculate gradients.
         G_loss.backward()
         # Update parameters.
@@ -204,16 +238,19 @@ for epoch in range(params['num_epochs']):
         D_losses.append(D_loss.item())
 
         iters += 1
+        
+    # schedulerD.step()
+    # schedulerG.step()
 
     epoch_time = time.time() - epoch_start_time
-    print("Time taken for Epoch %d: %.2fs" %(epoch + 1, epoch_time))
+    print("Time taken for Epoch %d: %.2fs" %(epoch + 1, epoch_time), "G Loss: ", np.mean(G_losses[-len(dataloader):]), "D Loss: ", np.mean(D_losses[-len(dataloader):]))
     # Generate image after each epoch to check performance of the generator. Used for creating animated gif later.
     with torch.no_grad():
         gen_data = netG(fixed_noise).detach().cpu()
     img_list.append(vutils.make_grid(gen_data, nrow=10, padding=2, normalize=True))
 
     # Generate image to check performance of generator.
-    if((epoch+1) == 1 or (epoch+1) == params['num_epochs']/2):
+    if((epoch+1) % 5 == 1):
         with torch.no_grad():
             gen_data = netG(fixed_noise).detach().cpu()
         plt.figure(figsize=(10, 10))
